@@ -56,6 +56,11 @@ class ALBEF(nn.Module):
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
 
+        # AGM state buffers (always zero in checkpoints; modulation logic in the plugin)
+        self.register_buffer("DELTA_IMG_LOSS", torch.zeros(1))
+        self.register_buffer("DELTA_TXT_LOSS", torch.zeros(1))
+        self.register_buffer("TOT", torch.zeros(1))
+
         # AGM infrastructure (modulation logic is in the plugin)
         self.HANDLES = []
         self.ACTIVATIONS = {}
