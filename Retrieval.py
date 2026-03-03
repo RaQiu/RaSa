@@ -5,7 +5,7 @@ import os
 import random
 import time
 import numpy as np
-import ruamel_yaml as yaml
+import ruamel.yaml as yaml
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -19,8 +19,9 @@ from models.tokenization_bert import BertTokenizer
 from models.vit import interpolate_pos_embed
 from optim import create_optimizer
 from scheduler import create_scheduler
+from rasa_modality_grad_modulator import RaSaModalityGradModulator, RaSaModulationConfig
 
-def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, modulator):
     # train
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -30,10 +31,21 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     metric_logger.add_meter('loss_mlm', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_prd', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_mrtd', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+
+    if args.distributed:
+        model.module.sync_buffers()
+        model.module.sync_queues()
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
     warmup_iterations = warmup_steps * step_size
+    data_len = len(data_loader)
+
+    # Build LAYER_REC mapping for this epoch
+    modulator.on_epoch_start(model)
+
     for i, (image1, image2, text1, text2, idx, replace) in enumerate(
             metric_logger.log_every(data_loader, print_freq, header)):
         image1 = image1.to(device, non_blocking=True)
@@ -46,14 +58,62 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
             alpha = config['alpha']
         else:
             alpha = config['alpha'] * min(1.0, i / len(data_loader))
+
+        # Normal forward pass
         loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd = model(image1, image2, text_input1, text_input2,
                                                                   alpha=alpha, idx=idx, replace=replace)
+        modulator.capture('normal', model)
+
+        # Image-erased forward pass
+        with torch.no_grad():
+            e_img_loss_cl, e_img_loss_pitm, e_img_loss_mlm, e_img_loss_prd, e_img_loss_mrtd = model(
+                image1, image2, text_input1,
+                text_input2,
+                alpha=alpha, idx=idx,
+                replace=replace,
+                type='E_IMG')
+            modulator.capture('e_img', model)
+
+            # Text-erased forward pass
+            e_txt_loss_cl, e_txt_loss_pitm, e_txt_loss_mlm, e_txt_loss_prd, e_txt_loss_mrtd = model(
+                image1, image2, text_input1,
+                text_input2,
+                alpha=alpha, idx=idx,
+                replace=replace,
+                type='E_TXT')
+            modulator.capture('e_txt', model)
+
+        # Compute weighted loss vectors
         loss = 0.
         for j, los in enumerate((loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd)):
             loss += config['weights'][j] * los
+        losses = torch.stack(
+            [torch.tensor(0).to(loss_cl), loss_pitm, loss_mlm, loss_prd, loss_mrtd])
+        all_loss = losses * torch.tensor(config['weights']).to(losses.device)
+
+        e_img_losses = torch.stack([torch.tensor(0).to(e_img_loss_cl), e_img_loss_pitm, e_img_loss_mlm, e_img_loss_prd, e_img_loss_mrtd])
+        e_img_loss = e_img_losses * torch.tensor(config['weights']).to(e_img_losses.device)
+
+        e_txt_losses = torch.stack([torch.tensor(0).to(e_txt_loss_cl), e_txt_loss_pitm, e_txt_loss_mlm, e_txt_loss_prd, e_txt_loss_mrtd])
+        e_txt_loss = e_txt_losses * torch.tensor(config['weights']).to(e_txt_losses.device)
+
         optimizer.zero_grad()
+        loss = loss / gradient_accumulation_steps
         loss.backward()
-        optimizer.step()
+
+        # Adaptive gradient modulation
+        modulator.post_backward(model, i, data_len, config['batch_size_train'],
+                                all_loss, e_txt_loss, e_img_loss)
+
+        if (i + 1) % gradient_accumulation_steps == 0:
+            if args.distributed:
+                for param in model.parameters():
+                    if param.grad is not None:
+                        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                        param.grad.data /= dist.get_world_size()
+
+            optimizer.step()
+            optimizer.zero_grad()
         metric_logger.update(loss_cl=loss_cl.item())
         metric_logger.update(loss_pitm=loss_pitm.item())
         metric_logger.update(loss_mlm=loss_mlm.item())
@@ -117,6 +177,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     end = min(sims_matrix.size(0), start + step)
     for i, sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)):
         topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+        topk_idx = topk_idx.to(image_feats.device)
         encoder_output = image_feats[topk_idx]
         encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
         output = model.text_encoder.bert(encoder_embeds=text_feats[start + i].repeat(config['k_test'], 1, 1),
@@ -217,7 +278,14 @@ def main(args, config):
     # Model
     print("Creating model")
     model = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=tokenizer)
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = model.to(device)
+
+    # Initialize modulation plugin
+    modulator = RaSaModalityGradModulator(RaSaModulationConfig())
+    modulator.attach(model)
+
     # Optimizer and learning rate scheduler
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
@@ -258,7 +326,21 @@ def main(args, config):
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
             train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler,
-                                config)
+                                config, modulator)
+            # Epoch-end: write modulation log and reset state
+            logger_info = modulator.on_epoch_end(model, epoch)
+            with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
+                f.write(logger_info)
+            save_obj = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'config': config,
+                'epoch': epoch,
+                'best': best,
+                'best_epoch': best_epoch
+            }
+            torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_epoch%02d.pth' % epoch))
         if epoch >= config['eval_epoch'] or args.evaluate:
             score_test_t2i = evaluation(model_without_ddp, test_loader, tokenizer, device, config)
             if utils.is_main_process():
@@ -318,6 +400,8 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help='Number of updates steps to accumulate before performing a backward/update pass')
     args = parser.parse_args()
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

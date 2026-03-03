@@ -27,6 +27,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 import torch.nn.functional as F
+from torch.nn.functional import embedding
 
 from transformers.activations import ACT2FN
 from transformers.file_utils import (
@@ -196,7 +197,7 @@ class BertEmbeddings(nn.Module):
         seq_length = input_shape[1]
 
         if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
+            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length].clone()
 
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
@@ -537,15 +538,17 @@ class BertEncoder(nn.Module):
         output_hidden_states=False,
         return_dict=True,
         mode='multi_modal',
+        etype=None,
+        FEATURE_RATIO=0.5,
+        NOISY_RATIO=0.5
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         next_decoder_cache = () if use_cache else None
-        
-                
-        if mode=='text': 
+
+        if mode=='text':
             start_layer = 0
             output_layer = self.config.fusion_layer
             
@@ -600,6 +603,8 @@ class BertEncoder(nn.Module):
                 )
 
             hidden_states = layer_outputs[0]
+            if etype == "E_TXT" and mode != 'text':
+                hidden_states = FEATURE_RATIO * hidden_states + NOISY_RATIO * torch.randn_like(hidden_states)
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
             if output_attentions:
@@ -954,6 +959,9 @@ class BertModel(BertPreTrainedModel):
         return_dict=None,
         is_decoder=False,
         mode='multi_modal',
+        etype=None,
+        FEATURE_RATIO=0.5,
+        NOISY_RATIO=0.5
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -1063,6 +1071,9 @@ class BertModel(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             mode=mode,
+            etype=etype,
+            NOISY_RATIO=NOISY_RATIO,
+            FEATURE_RATIO=FEATURE_RATIO
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
@@ -1385,6 +1396,9 @@ class BertForMaskedLM(BertPreTrainedModel):
         soft_labels=None,
         alpha=0,
         return_logits=False,
+        etype=None,
+        FEATURE_RATIO=0.5,
+        NOISY_RATIO=0.5,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1410,6 +1424,9 @@ class BertForMaskedLM(BertPreTrainedModel):
             return_dict=return_dict,
             is_decoder=is_decoder,
             mode=mode,
+            etype=etype,
+            FEATURE_RATIO=FEATURE_RATIO,
+            NOISY_RATIO=NOISY_RATIO,
         )
 
         sequence_output = outputs[0]

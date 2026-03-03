@@ -1,9 +1,12 @@
 from functools import partial
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import nn
 from models.vit import VisionTransformer
 from models.xbert import BertConfig, BertForMaskedLM
+import re
+
 
 class ALBEF(nn.Module):
     def __init__(self,
@@ -53,16 +56,62 @@ class ALBEF(nn.Module):
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
 
-    def forward(self, image1, image2, text1, text2, alpha, idx, replace):
+        # AGM infrastructure (modulation logic is in the plugin)
+        self.HANDLES = []
+        self.ACTIVATIONS = {}
+        self.BELONG = {"CM": set()}
+        self.FEATURE_RATIO = 0.5
+        self.NOISY_RATIO = 0.5
+
+    @torch.no_grad()
+    def sync_queues(self):
+        if dist.is_initialized():
+            dist.broadcast(self.image_queue, src=0)
+            dist.broadcast(self.text_queue, src=0)
+            dist.broadcast(self.idx_queue, src=0)
+            dist.broadcast(self.queue_ptr, src=0)
+
+    def sync_buffers(self):
+        if dist.is_initialized():
+            for buffer_name, buffer in self.named_buffers():
+                dist.broadcast(buffer, src=0)
+
+    def register_hook(self):
+        for name, module in self.named_modules():
+            if (not list(module.children()) and list(module.parameters())
+                    and ".attention" not in name
+                    and (not re.search(r"layer\.[0-5]\.", name))
+                    and name.startswith("text_encoder.bert.encoder")):
+                self.HANDLES.append(module.register_forward_hook(self.hook))
+                self.BELONG['CM'].add(module)
+        for name, module in self.named_modules():
+            if (not list(module.children()) and list(module.parameters())
+                    and ".attention" not in name
+                    and (not re.search(r"layer\.[0-5]\.", name))
+                    and name.startswith("text_encoder_m.bert.encoder")):
+                self.HANDLES.append(module.register_forward_hook(self.hook))
+                self.BELONG['CM'].add(module)
+
+    def remove_hook(self):
+        for hook in self.HANDLES:
+            hook.remove()
+        self.HANDLES = []
+
+    def hook(self, module, input, output):
+        self.ACTIVATIONS[module] = input[0].detach()
+
+    def forward(self, image1, image2, text1, text2, alpha, idx, replace, type="None"):
         # extract image features
         image_embeds = self.visual_encoder(image1)
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)
         image_feat = F.normalize(self.vision_proj(image_embeds[:, 0, :]), dim=-1)
+
         # extract text features
         text_output = self.text_encoder.bert(text2.input_ids, attention_mask=text2.attention_mask,
                                              return_dict=True, mode='text')
         text_embeds = text_output.last_hidden_state
         text_feat = F.normalize(self.text_proj(text_embeds[:, 0, :]), dim=-1)
+
         # Contrastive loss
         idx = idx.view(-1, 1)
         idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()], dim=1)
@@ -103,15 +152,35 @@ class ALBEF(nn.Module):
         self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx)
 
         # Relation-aware Learning: Probabilistic Image-Text Matching + Positive Relation Detection
-        # Probabilistic Image-Text Matching
-        # forward the positve image-text pairs
-        output_pos = self.text_encoder.bert(encoder_embeds=text_embeds,
-                                            attention_mask=text2.attention_mask,
-                                            encoder_hidden_states=image_embeds,
-                                            encoder_attention_mask=image_atts,
-                                            return_dict=True,
-                                            mode='fusion',
-                                            )
+        # Register hooks for cross-modal fusion activation capture
+        self.register_hook()
+        if type == "E_IMG":
+            e_image_embeds = image_embeds.clone()
+            e_image_embeds = self.FEATURE_RATIO * e_image_embeds + self.NOISY_RATIO * torch.randn_like(e_image_embeds)
+            output_pos = self.text_encoder.bert(encoder_embeds=text_embeds,
+                                                attention_mask=text2.attention_mask,
+                                                encoder_hidden_states=e_image_embeds,
+                                                encoder_attention_mask=image_atts,
+                                                return_dict=True,
+                                                mode='fusion')
+        elif type == 'E_TXT':
+            output_pos = self.text_encoder.bert(text2.input_ids,
+                                                attention_mask=text2.attention_mask,
+                                                encoder_hidden_states=image_embeds,
+                                                encoder_attention_mask=image_atts,
+                                                return_dict=True,
+                                                mode='fusion',
+                                                etype='E_TXT',
+                                                FEATURE_RATIO=self.FEATURE_RATIO,
+                                                NOISY_RATIO=self.NOISY_RATIO)
+        else:
+            output_pos = self.text_encoder.bert(encoder_embeds=text_embeds,
+                                                attention_mask=text2.attention_mask,
+                                                encoder_hidden_states=image_embeds,
+                                                encoder_attention_mask=image_atts,
+                                                return_dict=True,
+                                                mode='fusion')
+
         with torch.no_grad():
             bs = image1.size(0)
             weights_i2t = F.softmax(sim_i2t[:, :bs], dim=1)
@@ -122,22 +191,46 @@ class ALBEF(nn.Module):
         # select a negative image for each text
         image_neg_idx = torch.multinomial(weights_t2i, 1).flatten()
         image_embeds_neg = image_embeds[image_neg_idx]
-        # select a negative text for each image
         text_neg_idx = torch.multinomial(weights_i2t, 1).flatten()
         text_embeds_neg = text_embeds[text_neg_idx]
         text_atts_neg = text2.attention_mask[text_neg_idx]
+
         # forward the negative image-text pairs
         text_embeds_all = torch.cat([text_embeds, text_embeds_neg], dim=0)
         text_atts_all = torch.cat([text2.attention_mask, text_atts_neg], dim=0)
         image_embeds_all = torch.cat([image_embeds_neg, image_embeds], dim=0)
         image_atts_all = torch.cat([image_atts, image_atts], dim=0)
-        output_neg_cross = self.text_encoder.bert(encoder_embeds=text_embeds_all,
-                                                  attention_mask=text_atts_all,
-                                                  encoder_hidden_states=image_embeds_all,
-                                                  encoder_attention_mask=image_atts_all,
-                                                  return_dict=True,
-                                                  mode='fusion',
-                                                  )
+
+        if type == "E_IMG":
+            e_image_embeds_all = image_embeds_all.clone()
+            e_image_embeds_all = self.FEATURE_RATIO * e_image_embeds_all + self.NOISY_RATIO * torch.randn_like(
+                e_image_embeds_all)
+            output_neg_cross = self.text_encoder.bert(encoder_embeds=text_embeds_all,
+                                                      attention_mask=text_atts_all,
+                                                      encoder_hidden_states=e_image_embeds_all,
+                                                      encoder_attention_mask=image_atts_all,
+                                                      return_dict=True,
+                                                      mode='fusion',
+                                                      )
+        elif type == 'E_TXT':
+            output_neg_cross = self.text_encoder.bert(encoder_embeds=text_embeds_all,
+                                                      attention_mask=text_atts_all,
+                                                      encoder_hidden_states=image_embeds_all,
+                                                      encoder_attention_mask=image_atts_all,
+                                                      return_dict=True,
+                                                      mode='fusion',
+                                                      etype='E_TXT',
+                                                      FEATURE_RATIO=self.FEATURE_RATIO,
+                                                      NOISY_RATIO=self.NOISY_RATIO
+                                                      )
+        else:
+            output_neg_cross = self.text_encoder.bert(encoder_embeds=text_embeds_all,
+                                                      attention_mask=text_atts_all,
+                                                      encoder_hidden_states=image_embeds_all,
+                                                      encoder_attention_mask=image_atts_all,
+                                                      return_dict=True,
+                                                      mode='fusion',
+                                                      )
         vl_embeddings = torch.cat([output_pos.last_hidden_state[:, 0, :], output_neg_cross.last_hidden_state[:, 0, :]],
                                   dim=0)
         vl_output = self.itm_head(vl_embeddings)
@@ -154,48 +247,142 @@ class ALBEF(nn.Module):
         mrtd_input_ids = input_ids.clone()
         # Masked Language Modeling
         probability_matrix = torch.full(labels.shape, self.mlm_probability)
-        input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, targets=labels, probability_matrix=probability_matrix)
+        input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, targets=labels,
+                                      probability_matrix=probability_matrix)
         with torch.no_grad():
-            logits_m = self.text_encoder_m(input_ids,
-                                           attention_mask=text1.attention_mask,
-                                           encoder_hidden_states=image_embeds_m,
-                                           encoder_attention_mask=image_atts,
-                                           return_dict=True,
-                                           return_logits=True,
-                                           )
-            prediction = F.softmax(logits_m, dim=-1)
-        mlm_output = self.text_encoder(input_ids,
-                                       attention_mask=text1.attention_mask,
-                                       encoder_hidden_states=image_embeds,
-                                       encoder_attention_mask=image_atts,
-                                       return_dict=True,
-                                       labels=labels,
-                                       soft_labels=prediction,
-                                       alpha=alpha
-                                       )
-        loss_mlm = mlm_output.loss
-        # Momentum-based Replaced Token Detection
-        with torch.no_grad():
-            probability_matrix = torch.full(labels.shape, self.mrtd_mask_probability)
-            mrtd_input_ids = self.mask(mrtd_input_ids, self.text_encoder.config.vocab_size, probability_matrix=probability_matrix)
-            # momentum module is used as generator
-            mrtd_logits_m = self.text_encoder_m(mrtd_input_ids,
+            if type == 'E_IMG':
+                e_image_embeds_m = image_embeds.clone()
+                e_image_embeds_m = self.FEATURE_RATIO * e_image_embeds_m + self.NOISY_RATIO * torch.randn_like(
+                    e_image_embeds_m)
+                logits_m = self.text_encoder_m(input_ids,
+                                               attention_mask=text1.attention_mask,
+                                               encoder_hidden_states=e_image_embeds_m,
+                                               encoder_attention_mask=image_atts,
+                                               return_dict=True,
+                                               return_logits=True,
+                                               )
+            elif type == 'E_TXT':
+                logits_m = self.text_encoder_m(input_ids,
+                                               attention_mask=text1.attention_mask,
+                                               encoder_hidden_states=image_embeds_m,
+                                               encoder_attention_mask=image_atts,
+                                               return_dict=True,
+                                               return_logits=True,
+                                               etype='E_TXT',
+                                               FEATURE_RATIO=self.FEATURE_RATIO,
+                                               NOISY_RATIO=self.NOISY_RATIO
+                                               )
+            else:
+                logits_m = self.text_encoder_m(input_ids,
                                                attention_mask=text1.attention_mask,
                                                encoder_hidden_states=image_embeds_m,
                                                encoder_attention_mask=image_atts,
                                                return_dict=True,
                                                return_logits=True,
                                                )
+            prediction = F.softmax(logits_m, dim=-1)
+        if type == 'E_IMG':
+            e_image_embeds = image_embeds.clone()
+            e_image_embeds = self.FEATURE_RATIO * e_image_embeds + self.NOISY_RATIO * torch.randn_like(e_image_embeds)
+            mlm_output = self.text_encoder(input_ids,
+                                           attention_mask=text1.attention_mask,
+                                           encoder_hidden_states=e_image_embeds,
+                                           encoder_attention_mask=image_atts,
+                                           return_dict=True,
+                                           labels=labels,
+                                           soft_labels=prediction,
+                                           alpha=alpha
+                                           )
+        elif type == 'E_TXT':
+            mlm_output = self.text_encoder(input_ids,
+                                           attention_mask=text1.attention_mask,
+                                           encoder_hidden_states=image_embeds,
+                                           encoder_attention_mask=image_atts,
+                                           return_dict=True,
+                                           labels=labels,
+                                           soft_labels=prediction,
+                                           alpha=alpha,
+                                           etype="E_TXT",
+                                           FEATURE_RATIO=self.FEATURE_RATIO,
+                                           NOISY_RATIO=self.NOISY_RATIO
+                                           )
+        else:
+            mlm_output = self.text_encoder(input_ids,
+                                           attention_mask=text1.attention_mask,
+                                           encoder_hidden_states=image_embeds,
+                                           encoder_attention_mask=image_atts,
+                                           return_dict=True,
+                                           labels=labels,
+                                           soft_labels=prediction,
+                                           alpha=alpha
+                                           )
+        loss_mlm = mlm_output.loss
+        # Momentum-based Replaced Token Detection
+        with torch.no_grad():
+            probability_matrix = torch.full(labels.shape, self.mrtd_mask_probability)
+            mrtd_input_ids = self.mask(mrtd_input_ids, self.text_encoder.config.vocab_size,
+                                       probability_matrix=probability_matrix)
+            # momentum module is used as generator
+            if type == 'E_IMG':
+                e_image_embeds_m = image_embeds.clone()
+                e_image_embeds_m = self.FEATURE_RATIO * e_image_embeds_m + self.NOISY_RATIO * torch.randn_like(
+                    e_image_embeds_m)
+                mrtd_logits_m = self.text_encoder_m(mrtd_input_ids,
+                                                    attention_mask=text1.attention_mask,
+                                                    encoder_hidden_states=e_image_embeds_m,
+                                                    encoder_attention_mask=image_atts,
+                                                    return_dict=True,
+                                                    return_logits=True,
+                                                    )
+            elif type == 'E_TXT':
+                mrtd_logits_m = self.text_encoder_m(mrtd_input_ids,
+                                                    attention_mask=text1.attention_mask,
+                                                    encoder_hidden_states=image_embeds_m,
+                                                    encoder_attention_mask=image_atts,
+                                                    return_dict=True,
+                                                    return_logits=True,
+                                                    etype='E_TXT',
+                                                    FEATURE_RATIO=self.FEATURE_RATIO,
+                                                    NOISY_RATIO=self.NOISY_RATIO
+                                                    )
+            else:
+                mrtd_logits_m = self.text_encoder_m(mrtd_input_ids,
+                                                    attention_mask=text1.attention_mask,
+                                                    encoder_hidden_states=image_embeds_m,
+                                                    encoder_attention_mask=image_atts,
+                                                    return_dict=True,
+                                                    return_logits=True,
+                                                    )
             weights = F.softmax(mrtd_logits_m, dim=-1)
-            mrtd_input_ids, mrtd_labels = self.mrtd_mask_modeling(mrtd_input_ids, text1.input_ids, text1.attention_mask, weights)
-        output_mrtd = self.text_encoder.bert(mrtd_input_ids,
-                                            attention_mask=text1.attention_mask,
-                                            encoder_hidden_states=image_embeds,
-                                            encoder_attention_mask=image_atts,
-                                            return_dict=True,
-                                            )
+            mrtd_input_ids, mrtd_labels = self.mrtd_mask_modeling(mrtd_input_ids, text1.input_ids, text1.attention_mask,
+                                                                  weights)
+        if type == 'E_IMG':
+            e_image_embeds = image_embeds.clone()
+            e_image_embeds = self.FEATURE_RATIO * e_image_embeds + self.NOISY_RATIO * torch.randn_like(e_image_embeds)
+            output_mrtd = self.text_encoder.bert(mrtd_input_ids,
+                                                 attention_mask=text1.attention_mask,
+                                                 encoder_hidden_states=e_image_embeds,
+                                                 encoder_attention_mask=image_atts,
+                                                 return_dict=True)
+        elif type == 'E_TXT':
+            output_mrtd = self.text_encoder.bert(mrtd_input_ids,
+                                                 attention_mask=text1.attention_mask,
+                                                 encoder_hidden_states=image_embeds,
+                                                 encoder_attention_mask=image_atts,
+                                                 return_dict=True,
+                                                 etype="E_TXT",
+                                                 FEATURE_RATIO=self.FEATURE_RATIO,
+                                                 NOISY_RATIO=self.NOISY_RATIO)
+        else:
+            output_mrtd = self.text_encoder.bert(mrtd_input_ids,
+                                                 attention_mask=text1.attention_mask,
+                                                 encoder_hidden_states=image_embeds,
+                                                 encoder_attention_mask=image_atts,
+                                                 return_dict=True)
         mrtd_output = self.mrtd_head(output_mrtd.last_hidden_state.view(-1, self.text_width))
         loss_mrtd = F.cross_entropy(mrtd_output, mrtd_labels.view(-1))
+
+        self.remove_hook()
 
         return loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd
 
@@ -208,9 +395,19 @@ class ALBEF(nn.Module):
 
     @torch.no_grad()
     def _momentum_update(self):
-        for model_pair in self.model_pairs:
-            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
-                param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
+        if not dist.is_initialized():
+            for model_pair in self.model_pairs:
+                for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+                    param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
+        else:
+            if dist.get_rank() == 0:
+                for model_pair in self.model_pairs:
+                    for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+                        param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
+
+            for model_pair in self.model_pairs:
+                for param_m in model_pair[1].parameters():
+                    dist.broadcast(param_m.data, src=0)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, image_feat, text_feat, idx):
@@ -218,23 +415,28 @@ class ALBEF(nn.Module):
         image_feats = concat_all_gather(image_feat)
         text_feats = concat_all_gather(text_feat)
         idxs = concat_all_gather(idx)
+
         batch_size = image_feats.shape[0]
         ptr = int(self.queue_ptr)
-        # replace the keys at ptr (dequeue and enqueue)
-        empty = self.image_queue.size(1) - ptr
-        if batch_size <= empty:
-            self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
-            self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
-            self.idx_queue[:, ptr:ptr + batch_size] = idxs.T
-        else:
-            self.image_queue[:, ptr:] = image_feats[:empty].T
-            self.text_queue[:, ptr:] = text_feats[:empty].T
-            self.idx_queue[:, ptr:] = idxs[:empty].T
-            self.image_queue[:, :batch_size - empty] = image_feats[empty:].T
-            self.text_queue[:, :batch_size - empty] = text_feats[empty:].T
-            self.idx_queue[:, :batch_size - empty] = idxs[empty:].T
-        ptr = (ptr + batch_size) % self.queue_size  # move pointer
-        self.queue_ptr[0] = ptr
+
+        if dist.get_rank() == 0:
+            empty = self.image_queue.size(1) - ptr
+            if batch_size <= empty:
+                self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
+                self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
+                self.idx_queue[:, ptr:ptr + batch_size] = idxs.T
+            else:
+                self.image_queue[:, ptr:] = image_feats[:empty].T
+                self.text_queue[:, ptr:] = text_feats[:empty].T
+                self.idx_queue[:, ptr:] = idxs[:empty].T
+                self.image_queue[:, :batch_size - empty] = image_feats[empty:].T
+                self.text_queue[:, :batch_size - empty] = text_feats[empty:].T
+                self.idx_queue[:, :batch_size - empty] = idxs[empty:].T
+
+            ptr = (ptr + batch_size) % self.queue_size
+            self.queue_ptr[0] = ptr
+
+        self.sync_queues()
 
     def mask(self, input_ids, vocab_size, targets=None, masked_indices=None, probability_matrix=None):
         if masked_indices is None:
@@ -267,6 +469,7 @@ class ALBEF(nn.Module):
         mrtd_labels[mrtd_input_ids == self.tokenizer.pad_token_id] = -100
         mrtd_labels[mrtd_input_ids == self.tokenizer.cls_token_id] = -100
         return mrtd_input_ids, mrtd_labels
+
 
 @torch.no_grad()
 def concat_all_gather(tensor):
