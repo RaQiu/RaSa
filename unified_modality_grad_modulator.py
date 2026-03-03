@@ -526,10 +526,10 @@ class UnifiedModalityGradModulator:
                         continue
 
                     act = all_act[name]
-                    pen = self._build_pen_vector(
+                    pen, now = self._build_pen_vector(
                         name, act, iscore_txt, iscore_img,
                     )
-                    self._apply_pen_to_module(name, module, pen)
+                    self._apply_pen_to_module(name, module, pen, now)
 
                 # Encoder-level suppression (exclude shared modules)
                 shared_ids = {id(m) for m in self._shared_modules.values()}
@@ -705,6 +705,7 @@ class UnifiedModalityGradModulator:
 
         # Half-epoch gradient modification
         if (step + 1) % (data_len // 2) == 0 and dist.is_initialized():
+            self._times += 1
             # DDP sync
             dist.all_reduce(self._delta_img_loss)
             dist.all_reduce(self._delta_txt_loss)
@@ -888,12 +889,18 @@ class UnifiedModalityGradModulator:
         self._modal_txt_counts[name] += (indicate == 0)
 
     def _build_pen_vector(self, name, act, iscore_txt, iscore_img):
-        """Construct pen vector for a module (plugin mode)."""
+        """Construct pen vector for a module (plugin mode).
+
+        Returns:
+            (pen, now_or_none): pen vector and sigmoid 'now' state
+            (None if sigmoid disabled).
+        """
         cfg = self.config
         num_neurons = act.size(-1)
         pen = torch.zeros(num_neurons, device=act.device)
 
         # Track oscillation (sigmoid mode)
+        now = None
         if cfg.sigmoid_enabled:
             now = torch.zeros(num_neurons, device=act.device)
             now += (self._modal_img_counts[name] > self._modal_txt_counts[name]).to(torch.int)
@@ -927,14 +934,24 @@ class UnifiedModalityGradModulator:
         if cfg.clamp_pen:
             pen = torch.clamp(pen, min=0, max=1)
 
-        # Update last state (sigmoid)
-        if cfg.sigmoid_enabled:
-            self._last[name] = now
+        # NOTE: _last[name] is NOT updated here. It is updated inside
+        # _apply_pen_to_module, only when at least one param.grad is
+        # not None — matching the original IRRA inline behaviour where
+        # the assignment sits inside the ``for param`` loop.
 
-        return pen
+        return pen, now
 
-    def _apply_pen_to_module(self, name, module, pen):
-        """Apply pen vector to module gradients, with optional grad_ratio tracking."""
+    def _apply_pen_to_module(self, name, module, pen, now=None):
+        """Apply pen vector to module gradients, with optional grad_ratio tracking.
+
+        Args:
+            name: module name (for grad_ratio and sigmoid _last tracking)
+            module: the nn.Module whose gradients are being modulated
+            pen: the pen vector to apply
+            now: sigmoid 'now' state from _build_pen_vector (None if disabled).
+                 Will be written to self._last[name] inside the param loop,
+                 only when param.grad is not None — exactly as the original.
+        """
         for param in module.parameters():
             if param.grad is None:
                 continue
@@ -945,6 +962,10 @@ class UnifiedModalityGradModulator:
                 param.grad *= pen.unsqueeze(0)
             elif len(param.grad.size()) == 1 and param.grad.size() == pen.size():
                 param.grad *= pen
+
+            # Update sigmoid last state (inside param loop, matching original)
+            if now is not None:
+                self._last[name] = now
 
             # Gradient ratio tracking
             if self.config.grad_ratio_tracking and grad_before is not None:
